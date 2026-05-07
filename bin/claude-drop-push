@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""claude-drop-push — push a local file (or zipped directory) to a tailnet host.
+
+Usage:
+    claude-drop-push <host> <local-path> [<local-path> ...]
+
+Fire-and-forget. No responder needed on the destination — just the receiver.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+
+def zip_dir(src: Path) -> Path:
+    fd, tmp = tempfile.mkstemp(prefix="cdrop-push-", suffix=".zip")
+    os.close(fd)
+    base = src.name
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
+            dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__")]
+            for fn in filenames:
+                full = Path(dirpath) / fn
+                arc = Path(base) / full.relative_to(src)
+                try:
+                    zf.write(full, str(arc))
+                except OSError:
+                    continue
+    return Path(tmp)
+
+
+def send(host: str, path: Path) -> bool:
+    try:
+        subprocess.run(
+            ["tailscale", "file", "cp", str(path), f"{host}:"],
+            check=True, capture_output=True, timeout=600,
+        )
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"failed to push {path}: {e}", file=sys.stderr)
+        return False
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3:
+        print("usage: claude-drop-push <host> <path> [<path> ...]", file=sys.stderr)
+        return 2
+    host = argv[1]
+    rc = 0
+    for raw in argv[2:]:
+        p = Path(os.path.expanduser(raw)).resolve()
+        if not p.exists():
+            print(f"not found: {p}", file=sys.stderr)
+            rc = 1
+            continue
+        if p.is_dir():
+            z = zip_dir(p)
+            try:
+                if not send(host, z):
+                    rc = 1
+            finally:
+                z.unlink(missing_ok=True)
+        else:
+            if not send(host, p):
+                rc = 1
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

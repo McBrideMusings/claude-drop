@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Claude Drop receiver. Long-running. Pulls Taildrop deliveries into the inbox.
+# Run as a user service (launchd LaunchAgent on macOS, systemd user unit on Linux).
+
+set -u
+
+cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/claude-drop"
+inbox="$cache_root/inbox"
+mkdir -p "$inbox"
+chmod 700 "$cache_root" 2>/dev/null || true
+chmod 700 "$inbox" 2>/dev/null || true
+
+# Best-effort eviction of stale cache files on startup. Honors config.toml ttl_hours
+# if Python is available; falls back to 24h otherwise.
+ttl_hours=24
+if command -v python3 >/dev/null 2>&1; then
+    cfg_ttl=$(python3 - <<'PY' 2>/dev/null || true
+import os, sys
+try:
+    import tomllib
+except Exception:
+    sys.exit(0)
+home = os.path.expanduser("~")
+host = os.uname().nodename.split(".")[0]
+candidates = [
+    f"{home}/.claude/claude-drop/config.{host}.toml",
+    f"{home}/.claude/claude-drop/config.toml",
+]
+for p in candidates:
+    if os.path.exists(p):
+        with open(p, "rb") as f:
+            data = tomllib.load(f)
+        ttl = data.get("cache", {}).get("ttl_hours")
+        if isinstance(ttl, (int, float)):
+            print(int(ttl))
+            break
+PY
+)
+    if [ -n "${cfg_ttl:-}" ]; then
+        ttl_hours="$cfg_ttl"
+    fi
+fi
+
+if command -v find >/dev/null 2>&1; then
+    find "$cache_root/files" -type f -mmin "+$((ttl_hours * 60))" -delete 2>/dev/null || true
+    find "$cache_root/dirs" -mindepth 1 -maxdepth 1 -type d -mmin "+$((ttl_hours * 60))" -exec rm -rf {} + 2>/dev/null || true
+fi
+
+exec tailscale file get --loop --conflict=rename "$inbox/"

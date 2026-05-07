@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""claude-drop-responder — Source-side handler.
+
+Fired (NOT a daemon) by launchd WatchPaths or systemd path units when a
+req-*.json file lands in ~/.cache/claude-drop/inbox/. Processes every
+pending request found, then exits.
+
+For each request:
+  1. Schema check.
+  2. tailscale whois sender == own user (unless require_whois = false).
+  3. Longest-valid-prefix resolution against the local filesystem.
+  4. Deny-list check (resolved/realpath, post-symlink).
+  5. File: tailscale file cp directly. Dir: zip with exclusions or fall
+     back to tree listing if oversize. Always reply with done-<id>.json.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_DENY = [
+    "~/.ssh",
+    "~/.gnupg",
+    "~/Library/Keychains",
+    "~/.aws",
+    "~/.kube",
+    "~/.docker/config.json",
+    "~/.config/*token*",
+    "~/.config/*credential*",
+    "~/.config/gh/hosts.yml",
+    "~/.netrc",
+    "~/.pgpass",
+    "~/Library/Application Support/com.apple.iCloud*",
+    "*/.env",
+    "*/.env.*",
+    "**/id_rsa",
+    "**/id_ed25519",
+    "**/id_ecdsa",
+    "**/id_dsa",
+    "**/*.pem",
+    "**/*.key",
+    "**/*.p12",
+    "**/*.pfx",
+    "**/*.jks",
+]
+
+DEFAULT_EXCLUDE = [
+    ".git/", "node_modules/", "__pycache__/", ".venv/", "venv/", ".tox/",
+    ".mypy_cache/", ".pytest_cache/", ".cache/", "target/", "build/",
+    "dist/", "out/", ".next/", ".nuxt/", ".svelte-kit/",
+    ".DS_Store", "Thumbs.db", "*.pyc",
+]
+
+DEFAULT_MAX_RAW = 100 * 1024 * 1024
+DEFAULT_MAX_ZIP = 25 * 1024 * 1024
+
+
+def cache_root() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "claude-drop"
+
+
+def load_config() -> dict:
+    try:
+        import tomllib
+    except ImportError:
+        return {}
+    home = Path.home()
+    host = socket.gethostname().split(".")[0]
+    for path in [
+        home / ".claude" / "claude-drop" / f"config.{host}.toml",
+        home / ".claude" / "claude-drop" / "config.toml",
+    ]:
+        if path.exists():
+            try:
+                with path.open("rb") as f:
+                    return tomllib.load(f)
+            except Exception:
+                return {}
+    return {}
+
+
+def expand_deny(cfg: dict) -> list[str]:
+    extras = cfg.get("security", {}).get("deny_extra", []) or []
+    return DEFAULT_DENY + list(extras)
+
+
+def expand_exclude(cfg: dict) -> list[str]:
+    extras = cfg.get("directories", {}).get("exclude_extra", []) or []
+    return DEFAULT_EXCLUDE + list(extras)
+
+
+def is_denied(real: str, patterns: list[str]) -> bool:
+    home = str(Path.home())
+    for raw in patterns:
+        pat = raw.replace("~", home, 1) if raw.startswith("~") else raw
+        if fnmatch.fnmatch(real, pat):
+            return True
+        if pat.endswith("/") and (real == pat[:-1] or real.startswith(pat)):
+            return True
+        if not pat.startswith("/") and pat.startswith("**/"):
+            tail = pat[3:]
+            if fnmatch.fnmatch(os.path.basename(real), tail):
+                return True
+        if not pat.startswith("/") and pat.startswith("*/"):
+            tail = pat[2:]
+            if fnmatch.fnmatch(os.path.basename(real), tail):
+                return True
+    return False
+
+
+def resolve_candidate(candidate: str) -> str | None:
+    parts = candidate.strip()
+    while parts:
+        expanded = os.path.expanduser(parts)
+        if os.path.exists(expanded):
+            return os.path.realpath(expanded)
+        if " " not in parts:
+            return None
+        parts = parts.rsplit(" ", 1)[0]
+    return None
+
+
+def whois_user(reply_to: str) -> str | None:
+    try:
+        out = subprocess.run(
+            ["tailscale", "whois", "--json", reply_to],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode != 0:
+            return None
+        data = json.loads(out.stdout)
+        return data.get("UserProfile", {}).get("LoginName")
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def own_user() -> str | None:
+    try:
+        out = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode != 0:
+            return None
+        data = json.loads(out.stdout)
+        # Self.UserID -> User[id].LoginName
+        self_uid = data.get("Self", {}).get("UserID")
+        users = data.get("User", {})
+        u = users.get(str(self_uid)) if self_uid is not None else None
+        if u:
+            return u.get("LoginName")
+    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def excluded(rel: str, patterns: list[str]) -> bool:
+    base = os.path.basename(rel)
+    for pat in patterns:
+        if pat.endswith("/"):
+            seg = pat[:-1]
+            parts = rel.split(os.sep)
+            if seg in parts:
+                return True
+            continue
+        if fnmatch.fnmatch(base, pat) or fnmatch.fnmatch(rel, pat):
+            return True
+    return False
+
+
+def dir_raw_size(root: str, exclude: list[str]) -> int:
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        rel_dir = os.path.relpath(dirpath, root)
+        dirnames[:] = [d for d in dirnames if not excluded(os.path.join(rel_dir, d), exclude)]
+        for fn in filenames:
+            rel = os.path.join(rel_dir, fn) if rel_dir != "." else fn
+            if excluded(rel, exclude):
+                continue
+            try:
+                total += os.path.getsize(os.path.join(dirpath, fn))
+            except OSError:
+                pass
+    return total
+
+
+def dir_tree(root: str, exclude: list[str], max_entries: int = 5000) -> tuple[list[dict], bool]:
+    out: list[dict] = []
+    truncated = False
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        rel_dir = os.path.relpath(dirpath, root)
+        dirnames[:] = [d for d in dirnames if not excluded(os.path.join(rel_dir, d), exclude)]
+        for fn in filenames:
+            rel = os.path.join(rel_dir, fn) if rel_dir != "." else fn
+            if excluded(rel, exclude):
+                continue
+            try:
+                size = os.path.getsize(os.path.join(dirpath, fn))
+            except OSError:
+                continue
+            out.append({"path": rel, "size": size})
+            if len(out) >= max_entries:
+                truncated = True
+                return out, truncated
+    return out, truncated
+
+
+def make_zip(src: str, exclude: list[str]) -> str:
+    fd, tmp = tempfile.mkstemp(prefix="cdrop-", suffix=".zip")
+    os.close(fd)
+    base = os.path.basename(src.rstrip("/"))
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
+            rel_dir = os.path.relpath(dirpath, src)
+            dirnames[:] = [d for d in dirnames if not excluded(os.path.join(rel_dir, d), exclude)]
+            for fn in filenames:
+                rel = os.path.join(rel_dir, fn) if rel_dir != "." else fn
+                if excluded(rel, exclude):
+                    continue
+                full = os.path.join(dirpath, fn)
+                arcname = os.path.join(base, rel)
+                try:
+                    zf.write(full, arcname)
+                except OSError:
+                    continue
+    return tmp
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_done(reply_to: str, payload: dict, tmpdir: Path) -> Path:
+    p = tmpdir / f"done-{payload['id']}.json"
+    p.write_text(json.dumps(payload))
+    return p
+
+
+def tailscale_send(path: Path, reply_to: str) -> bool:
+    try:
+        subprocess.run(
+            ["tailscale", "file", "cp", str(path), f"{reply_to}:"],
+            check=True, capture_output=True, timeout=120,
+        )
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def reply(reply_to: str, payload: dict, work: Path, payload_file: Path | None = None) -> None:
+    """Send done sidecar and (if any) the payload file via tailscale file cp."""
+    done = write_done(reply_to, payload, work)
+    try:
+        if payload_file is not None and payload_file.exists():
+            tailscale_send(payload_file, reply_to)
+        tailscale_send(done, reply_to)
+    finally:
+        done.unlink(missing_ok=True)
+        if payload_file is not None:
+            try:
+                payload_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def handle_request(req_path: Path, cfg: dict) -> None:
+    work = Path(tempfile.mkdtemp(prefix="cdrop-resp-"))
+    try:
+        try:
+            data = json.loads(req_path.read_text())
+        except Exception:
+            return  # unreadable; no reply target known
+
+        req_id = data.get("id")
+        candidate = data.get("candidate")
+        reply_to = data.get("reply_to")
+        if not (isinstance(req_id, str) and isinstance(candidate, str) and isinstance(reply_to, str)):
+            if isinstance(req_id, str) and isinstance(reply_to, str):
+                reply(reply_to, {
+                    "v": 1, "id": req_id, "status": "error",
+                    "candidate": candidate, "error": "invalid request schema",
+                }, work)
+            return
+        if "\x00" in candidate or "\n" in candidate:
+            reply(reply_to, {
+                "v": 1, "id": req_id, "status": "error",
+                "candidate": candidate, "error": "candidate contains newline or null",
+            }, work)
+            return
+
+        if cfg.get("security", {}).get("require_whois", True):
+            sender = whois_user(reply_to)
+            mine = own_user()
+            if sender is None or mine is None or sender != mine:
+                reply(reply_to, {
+                    "v": 1, "id": req_id, "status": "denied",
+                    "candidate": candidate,
+                    "error": "sender failed tailscale whois user check",
+                }, work)
+                return
+
+        resolved = resolve_candidate(candidate)
+        if resolved is None:
+            reply(reply_to, {
+                "v": 1, "id": req_id, "status": "not_found",
+                "candidate": candidate, "error": "no valid prefix matched",
+            }, work)
+            return
+
+        if is_denied(resolved, expand_deny(cfg)):
+            reply(reply_to, {
+                "v": 1, "id": req_id, "status": "denied",
+                "candidate": candidate, "resolved_path": resolved,
+                "error": "path is in deny list",
+            }, work)
+            return
+
+        max_raw = int(cfg.get("directories", {}).get("max_raw_bytes", DEFAULT_MAX_RAW))
+        max_zip = int(cfg.get("directories", {}).get("max_zip_bytes", DEFAULT_MAX_ZIP))
+        exclude = expand_exclude(cfg)
+
+        if os.path.isdir(resolved):
+            raw = dir_raw_size(resolved, exclude)
+            if raw > max_raw:
+                tree, truncated = dir_tree(resolved, exclude)
+                tree_payload = {
+                    "kind": "tree_listing",
+                    "root": resolved,
+                    "raw_size_bytes": raw,
+                    "size_limit_bytes": max_raw,
+                    "tree": tree,
+                    "truncated": truncated,
+                }
+                tree_file = work / f"{Path(resolved).name}.tree.json"
+                tree_file.write_text(json.dumps(tree_payload))
+                reply(reply_to, {
+                    "v": 1, "id": req_id, "status": "tree_only",
+                    "candidate": candidate, "resolved_path": resolved,
+                    "filename": tree_file.name, "kind": "tree_listing",
+                    "size": tree_file.stat().st_size,
+                    "raw_size_bytes": raw, "tree": tree,
+                    "mtime": now_iso(),
+                }, work, tree_file)
+                return
+
+            zip_path = make_zip(resolved, exclude)
+            try:
+                if os.path.getsize(zip_path) > max_zip:
+                    os.unlink(zip_path)
+                    tree, truncated = dir_tree(resolved, exclude)
+                    tree_payload = {
+                        "kind": "tree_listing",
+                        "root": resolved,
+                        "raw_size_bytes": raw,
+                        "size_limit_bytes": max_zip,
+                        "tree": tree,
+                        "truncated": truncated,
+                    }
+                    tree_file = work / f"{Path(resolved).name}.tree.json"
+                    tree_file.write_text(json.dumps(tree_payload))
+                    reply(reply_to, {
+                        "v": 1, "id": req_id, "status": "tree_only",
+                        "candidate": candidate, "resolved_path": resolved,
+                        "filename": tree_file.name, "kind": "tree_listing",
+                        "size": tree_file.stat().st_size,
+                        "raw_size_bytes": raw, "tree": tree,
+                        "mtime": now_iso(),
+                    }, work, tree_file)
+                    return
+
+                final_zip = work / f"{Path(resolved).name}.zip"
+                os.replace(zip_path, final_zip)
+                reply(reply_to, {
+                    "v": 1, "id": req_id, "status": "ok",
+                    "candidate": candidate, "resolved_path": resolved,
+                    "filename": final_zip.name, "kind": "dir",
+                    "size": final_zip.stat().st_size,
+                    "sha256": sha256_file(str(final_zip)),
+                    "mtime": now_iso(),
+                }, work, final_zip)
+            except Exception as e:
+                if os.path.exists(zip_path):
+                    os.unlink(zip_path)
+                reply(reply_to, {
+                    "v": 1, "id": req_id, "status": "error",
+                    "candidate": candidate, "resolved_path": resolved,
+                    "error": f"zip failed: {e}",
+                }, work)
+            return
+
+        # Plain file. Tailscale needs the file to remain on disk during cp;
+        # link/copy to a workdir name keyed by basename so the receiver lands
+        # the right filename.
+        src_size = os.path.getsize(resolved)
+        if src_size > max_raw:
+            reply(reply_to, {
+                "v": 1, "id": req_id, "status": "too_large",
+                "candidate": candidate, "resolved_path": resolved,
+                "size": src_size, "size_limit_bytes": max_raw,
+                "error": "file exceeds max_raw_bytes",
+            }, work)
+            return
+
+        staged = work / Path(resolved).name
+        try:
+            os.link(resolved, staged)
+        except OSError:
+            import shutil
+            shutil.copy2(resolved, staged)
+
+        reply(reply_to, {
+            "v": 1, "id": req_id, "status": "ok",
+            "candidate": candidate, "resolved_path": resolved,
+            "filename": staged.name, "kind": "file",
+            "size": src_size,
+            "sha256": sha256_file(str(staged)),
+            "mtime": now_iso(),
+        }, work, staged)
+    finally:
+        try:
+            req_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        # work tempdir holds nothing once reply() cleans payloads
+        try:
+            for p in work.iterdir():
+                p.unlink(missing_ok=True)
+            work.rmdir()
+        except OSError:
+            pass
+
+
+def main() -> int:
+    cfg = load_config()
+    inbox = cache_root() / "inbox"
+    if not inbox.exists():
+        return 0
+    for entry in sorted(inbox.glob("req-*.json")):
+        try:
+            handle_request(entry, cfg)
+        except Exception:
+            try:
+                entry.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

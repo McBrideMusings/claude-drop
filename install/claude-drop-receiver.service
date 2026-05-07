@@ -1,0 +1,14 @@
+[Unit]
+Description=Claude Drop Taildrop receiver
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.claude/claude-drop/bin/claude-drop-receiver
+Restart=on-failure
+RestartSec=5
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

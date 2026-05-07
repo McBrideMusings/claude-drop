@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch Claude Drop inbox for new request files
+
+[Path]
+PathChanged=%h/.cache/claude-drop/inbox
+Unit=claude-drop-responder.service
+
+[Install]
+WantedBy=default.target

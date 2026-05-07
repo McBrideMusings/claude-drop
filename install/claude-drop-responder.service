@@ -1,0 +1,7 @@
+[Unit]
+Description=Claude Drop responder (one-shot, fired by claude-drop-responder.path)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env python3 %h/.claude/claude-drop/bin/claude-drop-responder
+Environment=PATH=/usr/local/bin:/usr/bin:/bin

@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""claude-drop-init — one-command setup for Claude Drop.
+
+Detects the OS, installs the receiver and responder as user services
+(launchd on macOS, systemd on Linux), patches ~/.claude/settings.json
+to wire the three hooks, verifies Tailscale, and prints a smoke-test.
+
+Idempotent: safe to re-run. Existing settings.json hooks are preserved;
+duplicate Drop entries are not added.
+
+Usage:
+    claude-drop-init [--dry-run] [--no-services] [--no-hooks]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+CLAUDE = Path.home() / ".claude"
+DROP = CLAUDE / "claude-drop"
+HOOKS_DIR = CLAUDE / "hooks"
+SETTINGS = CLAUDE / "settings.json"
+
+HOOK_ENTRIES = {
+    "SessionStart": {
+        "matcher": "",
+        "command": "bash ~/.claude/hooks/session-claude-drop-init.sh",
+    },
+    "UserPromptSubmit": {
+        "matcher": "",
+        "command": "bash ~/.claude/hooks/user-prompt-claude-drop.sh",
+    },
+    "PreToolUse": {
+        "matcher": "Read|Bash",
+        "command": "bash ~/.claude/hooks/pretool-claude-drop.sh",
+    },
+}
+
+
+def info(msg: str) -> None:
+    print(f"  {msg}")
+
+
+def section(msg: str) -> None:
+    print(f"\n== {msg} ==")
+
+
+def warn(msg: str) -> None:
+    print(f"  ! {msg}")
+
+
+def err(msg: str) -> None:
+    print(f"  ✗ {msg}", file=sys.stderr)
+
+
+def ok(msg: str) -> None:
+    print(f"  ✓ {msg}")
+
+
+def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=check, capture_output=True, text=True)
+
+
+def check_prereqs() -> bool:
+    section("Prerequisites")
+    all_ok = True
+    if not shutil.which("tailscale"):
+        err("tailscale not on PATH — install Tailscale first")
+        all_ok = False
+    else:
+        ok("tailscale found")
+    if sys.version_info < (3, 11):
+        err(f"Python 3.11+ required (have {sys.version_info.major}.{sys.version_info.minor})")
+        all_ok = False
+    else:
+        ok(f"Python {sys.version_info.major}.{sys.version_info.minor}")
+    if not shutil.which("jq"):
+        warn("jq not found — hooks need it; install via your package manager")
+        all_ok = False
+    else:
+        ok("jq found")
+    if not DROP.exists():
+        err(f"{DROP} missing — Claude Drop is not installed in this checkout")
+        all_ok = False
+    else:
+        ok("claude-drop tree present")
+    return all_ok
+
+
+def install_services_macos(dry_run: bool) -> None:
+    section("Installing launchd services (macOS)")
+    for which in ("receiver", "responder"):
+        script = DROP / "install" / f"install-{which}-launchd.sh"
+        if not script.exists():
+            err(f"missing {script}")
+            continue
+        if dry_run:
+            info(f"would run: bash {script}")
+            continue
+        try:
+            run(["bash", str(script)])
+            ok(f"installed {which}")
+        except subprocess.CalledProcessError as e:
+            err(f"{which} install failed: {e.stderr.strip()}")
+
+
+def install_services_linux(dry_run: bool) -> None:
+    section("Installing systemd user units (Linux)")
+    for which in ("receiver", "responder"):
+        script = DROP / "install" / f"install-{which}-systemd.sh"
+        if not script.exists():
+            err(f"missing {script}")
+            continue
+        if dry_run:
+            info(f"would run: bash {script}")
+            continue
+        try:
+            run(["bash", str(script)])
+            ok(f"installed {which}")
+        except subprocess.CalledProcessError as e:
+            err(f"{which} install failed: {e.stderr.strip()}")
+
+
+def install_services(dry_run: bool) -> None:
+    sysname = platform.system()
+    if sysname == "Darwin":
+        install_services_macos(dry_run)
+    elif sysname == "Linux":
+        install_services_linux(dry_run)
+    else:
+        err(f"unsupported platform: {sysname}")
+
+
+def hook_already_present(hooks: list[dict], command: str) -> bool:
+    for entry in hooks:
+        for h in entry.get("hooks", []) or []:
+            if h.get("command") == command:
+                return True
+    return False
+
+
+def patch_settings(dry_run: bool) -> bool:
+    section("Wiring hooks into settings.json")
+    if not SETTINGS.exists():
+        # Bootstrap a minimal settings.json so we can add hooks.
+        if dry_run:
+            info(f"would create {SETTINGS} with default scaffold")
+            return True
+        SETTINGS.write_text(json.dumps({"hooks": {}}, indent=2) + "\n")
+        ok(f"created {SETTINGS}")
+
+    try:
+        data = json.loads(SETTINGS.read_text())
+    except Exception as e:
+        err(f"could not parse {SETTINGS}: {e}")
+        return False
+
+    hooks = data.setdefault("hooks", {})
+    changed = False
+    for event, spec in HOOK_ENTRIES.items():
+        bucket = hooks.setdefault(event, [])
+        if hook_already_present(bucket, spec["command"]):
+            ok(f"{event}: already wired")
+            continue
+        bucket.append({
+            "matcher": spec["matcher"],
+            "hooks": [{"type": "command", "command": spec["command"]}],
+        })
+        changed = True
+        ok(f"{event}: added")
+
+    if not changed:
+        info("settings.json already up to date")
+        return True
+
+    if dry_run:
+        info("would write updated settings.json")
+        return True
+
+    backup = SETTINGS.with_suffix(".json.bak")
+    backup.write_text(SETTINGS.read_text())
+    SETTINGS.write_text(json.dumps(data, indent=2) + "\n")
+    ok(f"wrote {SETTINGS} (backup at {backup.name})")
+    return True
+
+
+def smoke_test() -> None:
+    section("Smoke test")
+    inbox = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "claude-drop" / "inbox"
+    if inbox.exists():
+        ok(f"inbox at {inbox}")
+    else:
+        warn(f"inbox missing at {inbox} — receiver hasn't run yet")
+
+    try:
+        out = run(["tailscale", "status", "--json"], check=False)
+        if out.returncode == 0:
+            ok("tailscale status OK")
+        else:
+            warn("tailscale status failed; ensure tailscaled is running")
+    except FileNotFoundError:
+        warn("tailscale CLI not found")
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(description="Set up Claude Drop on this machine.")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-services", action="store_true", help="skip installing launchd/systemd services")
+    p.add_argument("--no-hooks", action="store_true", help="skip patching settings.json")
+    args = p.parse_args(argv[1:])
+
+    print("Claude Drop init")
+    if not check_prereqs():
+        warn("Prerequisites incomplete — continuing, but expect failures.")
+
+    if not args.no_services:
+        install_services(args.dry_run)
+
+    if not args.no_hooks:
+        patch_settings(args.dry_run)
+
+    smoke_test()
+
+    print()
+    print("Done. Run on every machine you ssh from / into.")
+    print("  - Test: ssh into another tailnet host running this and reference an SSH-client-side file.")
+    print("  - Logs: ~/.cache/claude-drop/{receiver,responder}.{log,err.log}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

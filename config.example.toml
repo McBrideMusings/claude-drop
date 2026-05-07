@@ -1,0 +1,30 @@
+# Copy to ~/.claude/claude-drop/config.toml (or config.<hostname>.toml).
+# Per-machine overrides win over the base file.
+
+[fetch]
+# Per-fetch timeout in seconds.
+timeout = 8
+
+[cache]
+# How long fetched files are kept (hours).
+ttl_hours = 24
+# Where the cache lives. Defaults to $XDG_CACHE_HOME/claude-drop, then $HOME/.cache/claude-drop.
+# dir = "/some/other/path"
+
+[directories]
+# Pre-zip raw size limit (bytes). Above this, send a tree listing instead of zipping.
+max_raw_bytes = 104857600       # 100 MB
+# Post-zip transfer limit (bytes). Above this, discard zip and send a tree listing.
+max_zip_bytes = 26214400        # 25 MB
+# Extra exclusion patterns (added to defaults).
+exclude_extra = []
+
+[security]
+# Extra deny patterns (added to defaults). Glob-style; matched against the resolved path.
+deny_extra = []
+# Sender authentication via `tailscale whois`. Disabling is NOT recommended.
+require_whois = true
+
+[sources]
+# Optional aliases for hostnames.
+# mac = "pierce-mbp"

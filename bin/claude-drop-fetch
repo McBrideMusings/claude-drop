@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""claude-drop-fetch — UserPromptSubmit-side parallel Taildrop fetcher.
+
+Usage:
+    claude-drop-fetch <host> <candidate> [<candidate> ...]
+
+For each candidate, generates a request UUID, writes a req-<uuid>.json,
+sends it to the source host via `tailscale file cp`, then polls the local
+inbox for a matching done-<uuid>.json. On success, moves the delivered
+file/zip into ~/.cache/claude-drop/files/ (or unzips into dirs/) and emits
+a JSON map on stdout: candidate -> result.
+
+Never raises; all failures end up as JSON entries with status != "ok".
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import hashlib
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import uuid
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_TIMEOUT = 8
+
+
+def cache_root() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    root = Path(base) / "claude-drop"
+    (root / "inbox").mkdir(parents=True, exist_ok=True)
+    (root / "files").mkdir(parents=True, exist_ok=True)
+    (root / "dirs").mkdir(parents=True, exist_ok=True)
+    (root / "outbox").mkdir(parents=True, exist_ok=True)
+    try:
+        root.chmod(0o700)
+    except OSError:
+        pass
+    return root
+
+
+def load_config() -> dict:
+    try:
+        import tomllib
+    except ImportError:
+        return {}
+    home = Path.home()
+    host = socket.gethostname().split(".")[0]
+    candidates = [
+        home / ".claude" / "claude-drop" / f"config.{host}.toml",
+        home / ".claude" / "claude-drop" / "config.toml",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                with path.open("rb") as f:
+                    return tomllib.load(f)
+            except Exception:
+                return {}
+    return {}
+
+
+def fetch_timeout(cfg: dict) -> float:
+    try:
+        return float(cfg.get("fetch", {}).get("timeout", DEFAULT_TIMEOUT))
+    except Exception:
+        return DEFAULT_TIMEOUT
+
+
+def sha8(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:8]
+
+
+def send_request(host: str, candidate: str, root: Path) -> str:
+    req_id = str(uuid.uuid4())
+    reply_to = socket.gethostname().split(".")[0]
+    payload = {
+        "v": 1,
+        "id": req_id,
+        "action": "fetch",
+        "candidate": candidate,
+        "reply_to": reply_to,
+        "requested_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    }
+    out_dir = root / "outbox"
+    out_path = out_dir / f"req-{req_id}.json"
+    out_path.write_text(json.dumps(payload))
+    try:
+        subprocess.run(
+            ["tailscale", "file", "cp", str(out_path), f"{host}:"],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        out_path.unlink(missing_ok=True)
+        raise RuntimeError(f"tailscale file cp failed: {e}") from e
+    out_path.unlink(missing_ok=True)
+    return req_id
+
+
+def wait_for_done(req_id: str, inbox: Path, timeout: float) -> dict | None:
+    """Poll for done-<id>.json. Returns parsed JSON or None on timeout."""
+    deadline = time.time() + timeout
+    done_path = inbox / f"done-{req_id}.json"
+    while time.time() < deadline:
+        if done_path.exists():
+            try:
+                data = json.loads(done_path.read_text())
+            except Exception:
+                time.sleep(0.05)
+                continue
+            return data
+        time.sleep(0.1)
+    return None
+
+
+def wait_for_payload(filename: str, inbox: Path, timeout: float) -> Path | None:
+    """Wait for the actual delivered file matching `filename`. Tailscale's
+    --conflict=rename may add a suffix; accept the closest match."""
+    deadline = time.time() + timeout
+    base, ext = os.path.splitext(filename)
+    while time.time() < deadline:
+        exact = inbox / filename
+        if exact.exists():
+            return exact
+        # Check rename variants like "name (1).ext" or "name.ext.1"
+        for entry in inbox.iterdir():
+            n = entry.name
+            if n == filename:
+                return entry
+            if n.startswith(base) and n.endswith(ext) and entry.is_file():
+                return entry
+        time.sleep(0.1)
+    return None
+
+
+def stash_file(payload_path: Path, sha: str, files_dir: Path) -> Path:
+    target = files_dir / f"{sha}-{payload_path.name}"
+    if target.exists():
+        payload_path.unlink(missing_ok=True)
+        return target
+    shutil.move(str(payload_path), str(target))
+    return target
+
+
+def stash_dir(zip_path: Path, sha: str, basename: str, dirs_dir: Path) -> Path:
+    target = dirs_dir / f"{sha}-{basename}"
+    if target.exists():
+        zip_path.unlink(missing_ok=True)
+        return target
+    target.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(target)
+    finally:
+        zip_path.unlink(missing_ok=True)
+    return target
+
+
+def fetch_one(host: str, candidate: str, root: Path, timeout: float) -> dict:
+    inbox = root / "inbox"
+    files_dir = root / "files"
+    dirs_dir = root / "dirs"
+    try:
+        req_id = send_request(host, candidate, root)
+    except Exception as e:
+        return {"status": "error", "error": str(e), "candidate": candidate}
+
+    done = wait_for_done(req_id, inbox, timeout)
+    if done is None:
+        return {"status": "error", "error": "timeout waiting for response", "candidate": candidate}
+
+    done_path = inbox / f"done-{req_id}.json"
+    status = done.get("status", "error")
+
+    try:
+        if status != "ok":
+            return {
+                "status": status,
+                "candidate": candidate,
+                "error": done.get("error"),
+                "resolved_path": done.get("resolved_path"),
+                "raw_size_bytes": done.get("raw_size_bytes"),
+                "tree": done.get("tree"),
+            }
+
+        filename = done.get("filename")
+        kind = done.get("kind", "file")
+        if not filename:
+            return {"status": "error", "error": "missing filename in response", "candidate": candidate}
+
+        payload = wait_for_payload(filename, inbox, timeout)
+        if payload is None:
+            return {"status": "error", "error": "payload never arrived", "candidate": candidate}
+
+        sha = done.get("sha256", "")[:8] or sha8(payload.read_bytes() if payload.stat().st_size < 64 * 1024 else payload.name.encode())
+
+        if kind == "dir":
+            local = stash_dir(payload, sha, Path(done.get("resolved_path", filename)).name, dirs_dir)
+        else:
+            local = stash_file(payload, sha, files_dir)
+
+        return {
+            "status": "ok",
+            "candidate": candidate,
+            "resolved_path": done.get("resolved_path"),
+            "local_path": str(local),
+            "kind": kind,
+            "size": done.get("size"),
+        }
+    finally:
+        done_path.unlink(missing_ok=True)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3:
+        print(json.dumps({"error": "usage: claude-drop-fetch <host> <candidate> [<candidate> ...]"}), file=sys.stderr)
+        return 2
+    host = argv[1]
+    candidates = argv[2:]
+    cfg = load_config()
+    timeout = fetch_timeout(cfg)
+    root = cache_root()
+
+    results: dict[str, dict] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(candidates))) as ex:
+        futures = {ex.submit(fetch_one, host, c, root, timeout): c for c in candidates}
+        for fut in concurrent.futures.as_completed(futures):
+            c = futures[fut]
+            try:
+                results[c] = fut.result()
+            except Exception as e:
+                results[c] = {"status": "error", "error": str(e), "candidate": c}
+
+    print(json.dumps(results))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
