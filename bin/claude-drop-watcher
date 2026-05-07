@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Long-running polling watcher for the responder. Runs the responder whenever
+# new req-*.json files land in the inbox. Used in environments without
+# systemd path units or launchd WatchPaths (containers, minimal Linux).
+
+set -u
+
+cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/claude-drop"
+inbox="$cache_root/inbox"
+mkdir -p "$inbox"
+
+responder="$(dirname "$0")/claude-drop-responder"
+[ -x "$responder" ] || { echo "claude-drop-watcher: responder missing at $responder" >&2; exit 1; }
+
+interval="${CLAUDE_DROP_WATCH_INTERVAL:-1}"
+
+while true; do
+    if compgen -G "$inbox/req-*.json" > /dev/null; then
+        python3 "$responder" 2>>"$cache_root/responder.err.log" 1>>"$cache_root/responder.log" || true
+    fi
+    sleep "$interval"
+done

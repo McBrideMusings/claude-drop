@@ -111,21 +111,44 @@ def install_services_macos(dry_run: bool) -> None:
             err(f"{which} install failed: {e.stderr.strip()}")
 
 
+def systemd_available() -> bool:
+    """systemd user bus reachable? False inside most containers."""
+    if not shutil.which("systemctl"):
+        return False
+    try:
+        out = run(["systemctl", "--user", "is-system-running"], check=False)
+        # is-system-running prints things like "running", "degraded", "offline"
+        # The exit code is non-zero for "offline"/"unknown", but stdout is the truth.
+        return out.returncode == 0 or out.stdout.strip() in {"running", "degraded", "starting"}
+    except Exception:
+        return False
+
+
 def install_services_linux(dry_run: bool) -> None:
-    section("Installing systemd user units (Linux)")
-    for which in ("receiver", "responder"):
-        script = DROP / "install" / f"install-{which}-systemd.sh"
-        if not script.exists():
-            err(f"missing {script}")
-            continue
-        if dry_run:
-            info(f"would run: bash {script}")
-            continue
-        try:
-            run(["bash", str(script)])
-            ok(f"installed {which}")
-        except subprocess.CalledProcessError as e:
-            err(f"{which} install failed: {e.stderr.strip()}")
+    section("Installing services (Linux)")
+    if systemd_available():
+        for which in ("receiver", "responder"):
+            script = DROP / "install" / f"install-{which}-systemd.sh"
+            if not script.exists():
+                err(f"missing {script}")
+                continue
+            if dry_run:
+                info(f"would run: bash {script}")
+                continue
+            try:
+                run(["bash", str(script)])
+                ok(f"installed {which}")
+            except subprocess.CalledProcessError as e:
+                err(f"{which} install failed: {e.stderr.strip()}")
+        return
+
+    # No systemd (container, chroot, etc.). Tell the operator how to run the
+    # receiver and watcher in the foreground / from an entrypoint script.
+    warn("systemd user bus not available — likely a container.")
+    info("Skipping systemd install. Spawn these from your container entrypoint:")
+    info(f"  {DROP}/bin/claude-drop-receiver &")
+    info(f"  {DROP}/bin/claude-drop-watcher &")
+    info("(claude-drop-watcher is the systemd-less fallback for the responder.)")
 
 
 def install_services(dry_run: bool) -> None:
