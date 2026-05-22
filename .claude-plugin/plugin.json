@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "claude-drop",
+  "version": "0.1.0",
+  "description": "Tailscale-backed file fetching across SSH boundaries — transparently pulls SSH-client-side paths into the remote Claude Code session via Taildrop",
+  "author": {
+    "name": "McBrideMusings"
+  },
+  "repository": "https://github.com/McBrideMusings/claude-drop",
+  "keywords": ["tailscale", "ssh", "taildrop", "file-sync", "remote"]
+}
