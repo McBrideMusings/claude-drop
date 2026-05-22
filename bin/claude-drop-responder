@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -133,10 +134,34 @@ def resolve_candidate(candidate: str) -> str | None:
     return None
 
 
-def whois_user(reply_to: str) -> str | None:
+def _resolve_to_tailnet_ip(reply_to: str) -> str | None:
+    # `tailscale whois` only accepts an IP address. claude-drop-fetch sends
+    # `reply_to` as a short hostname, so resolve it via `tailscale ip --4`.
+    try:
+        ipaddress.ip_address(reply_to)
+        return reply_to
+    except ValueError:
+        pass
     try:
         out = subprocess.run(
-            ["tailscale", "whois", "--json", reply_to],
+            ["tailscale", "ip", "--4", reply_to],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode != 0:
+            return None
+        line = out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
+        return line or None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def whois_user(reply_to: str) -> str | None:
+    addr = _resolve_to_tailnet_ip(reply_to)
+    if addr is None:
+        return None
+    try:
+        out = subprocess.run(
+            ["tailscale", "whois", "--json", addr],
             capture_output=True, text=True, timeout=5,
         )
         if out.returncode != 0:

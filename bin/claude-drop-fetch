@@ -29,7 +29,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_TIMEOUT = 8
+DEFAULT_TIMEOUT = 15
 
 
 def cache_root() -> Path:
