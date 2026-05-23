@@ -174,4 +174,47 @@ else
 fi
 echo
 
+echo "=== settings.json hook regressions ==="
+settings="$HOME/.claude/settings.json"
+if [ -f "$settings" ]; then
+    if grep -qE 'bash ~/\.claude/hooks/(session-claude-drop-init|user-prompt-claude-drop|pretool-claude-drop)\.sh' "$settings"; then
+        echo "  settings.json STILL references the pre-plugin hook scripts:"
+        grep -nE 'bash ~/\.claude/hooks/(session-claude-drop-init|user-prompt-claude-drop|pretool-claude-drop)\.sh' "$settings" | sed 's/^/    /'
+        echo "  These cause 'no such file' hook errors every prompt/session because"
+        echo "  the scripts they reference were removed when the plugin took over."
+        echo "  Fix: edit $settings and remove those three hook entries."
+        echo "  (The plugin's own hooks/hooks.json registers equivalents at"
+        echo "   \${CLAUDE_PLUGIN_ROOT}/hooks/... — they're the ones that should fire.)"
+    else
+        echo "  $settings clean of legacy claude-drop hook entries (good)"
+    fi
+else
+    echo "  $settings not present"
+fi
+echo
+
+echo "=== session-host cache ==="
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/claude-drop"
+host_files=$(ls -1 "$runtime_dir"/session-host-* 2>/dev/null || true)
+if [ -z "$host_files" ]; then
+    echo "  no session-host cache files (will be created on next SSH'd session)"
+else
+    bad=0
+    for hf in $host_files; do
+        contents=$(cat "$hf" 2>/dev/null)
+        if [[ "$contents" =~ [[:space:]] ]] || [[ "$contents" =~ [^a-zA-Z0-9.-] ]]; then
+            echo "  $(basename "$hf"): \"$contents\" — STALE (looks like a friendly device name, not a tailnet hostname)"
+            bad=$((bad+1))
+        else
+            echo "  $(basename "$hf"): $contents (looks ok)"
+        fi
+    done
+    if [ "$bad" -gt 0 ]; then
+        echo "  Stale entries are from an older plugin version that read .HostName"
+        echo "  instead of .DNSName. Clear with: rm $runtime_dir/session-host-*"
+        echo "  Then restart your claude session to re-resolve."
+    fi
+fi
+echo
+
 exit 0

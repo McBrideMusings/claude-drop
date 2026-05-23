@@ -30,7 +30,7 @@ host=$(tailscale status --json 2>/dev/null \
         ([.Self] + (.Peer | to_entries | map(.value)))
         | map(select(.TailscaleIPs and (.TailscaleIPs | index($ip))))
         | first
-        | .HostName // empty
+        | (.DNSName // "") | split(".") | .[0] // empty
     ' 2>/dev/null)
 
 [ -n "$host" ] || exit 0

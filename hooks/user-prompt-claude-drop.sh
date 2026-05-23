@@ -34,7 +34,7 @@ if [ -z "$host" ]; then
                 ([.Self] + (.Peer | to_entries | map(.value)))
                 | map(select(.TailscaleIPs and (.TailscaleIPs | index($ip))))
                 | first
-                | .HostName // empty
+                | (.DNSName // "") | split(".") | .[0] // empty
             ' 2>/dev/null)
         if [ -n "$host" ]; then
             printf '%s' "$host" > "$host_file"
