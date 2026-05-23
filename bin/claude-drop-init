@@ -24,7 +24,10 @@ import sys
 from pathlib import Path
 
 CLAUDE = Path.home() / ".claude"
-DROP = CLAUDE / "claude-drop"
+# Plugin root: prefer the env var set by Claude Code when this script is
+# invoked from a slash command; otherwise derive from this script's own
+# location (works when running the binary directly out of the plugin tree).
+DROP = Path(os.environ.get("CLAUDE_PLUGIN_ROOT") or Path(__file__).resolve().parent.parent)
 HOOKS_DIR = CLAUDE / "hooks"
 SETTINGS = CLAUDE / "settings.json"
 
@@ -86,11 +89,11 @@ def check_prereqs() -> bool:
         all_ok = False
     else:
         ok("jq found")
-    if not DROP.exists():
-        err(f"{DROP} missing — Claude Drop is not installed in this checkout")
+    if not (DROP / "install").exists():
+        err(f"install/ missing under {DROP} — plugin tree looks broken")
         all_ok = False
     else:
-        ok("claude-drop tree present")
+        ok(f"plugin tree at {DROP}")
     return all_ok
 
 

@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# claude-drop-doctor — diagnose claude-drop install state on this machine.
+# Writes a structured text report to stdout. Always exits 0.
+#
+# Designed to be consumed by /claude-drop:doctor (a slash command that
+# parses this report and summarizes it for the user).
+
+set -u
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+plugin_root="${CLAUDE_PLUGIN_ROOT:-$(cd "$script_dir/.." && pwd)}"
+inbox="${XDG_CACHE_HOME:-$HOME/.cache}/claude-drop/inbox"
+
+echo "=== claude-drop doctor ==="
+echo "plugin_root: $plugin_root"
+echo "platform:    $(uname -s)"
+echo "user:        $(id -un)"
+echo
+
+echo "=== tailscale ==="
+if command -v tailscale >/dev/null 2>&1; then
+    ts_bin=$(command -v tailscale)
+    echo "  cli: $ts_bin"
+    if "$ts_bin" status >/dev/null 2>&1; then
+        echo "  daemon reachable: yes"
+    else
+        echo "  daemon reachable: NO (tailscale status failed)"
+    fi
+    operator=$("$ts_bin" debug prefs 2>/dev/null \
+        | grep -o '"OperatorUser":[[:space:]]*"[^"]*"' \
+        | sed 's/.*"\([^"]*\)"$/\1/' || true)
+    if [ -n "$operator" ]; then
+        echo "  operator: $operator"
+    else
+        echo "  operator: NOT SET (fix: sudo tailscale set --operator=\$USER)"
+    fi
+else
+    echo "  cli: NOT FOUND on PATH"
+fi
+echo
+
+echo "=== inbox ==="
+if [ -d "$inbox" ]; then
+    echo "  $inbox: present"
+else
+    echo "  $inbox: MISSING (will be created by /claude-drop:init)"
+fi
+echo
+
+case "$(uname -s)" in
+    Darwin)
+        echo "=== launchd services ==="
+        labels=$(launchctl list 2>&1 | awk '/claude-drop/ {print $3}' || true)
+        if [ -z "$labels" ]; then
+            echo "  no claude-drop launchd jobs loaded"
+        else
+            for label in $labels; do
+                plist="$HOME/Library/LaunchAgents/${label}.plist"
+                # Find the first ProgramArguments string that looks like a
+                # binary path (skip /usr/bin/env, python3, etc).
+                exec_path=""
+                if [ -f "$plist" ]; then
+                    exec_path=$(awk '
+                        /<key>ProgramArguments<\/key>/ {flag=1; next}
+                        flag && /<\/array>/ {flag=0}
+                        flag && /<string>/ {
+                            line=$0
+                            sub(/.*<string>/, "", line)
+                            sub(/<\/string>.*/, "", line)
+                            if (line ~ /^\// && line !~ /\/env$/ && line != "python3") {
+                                print line; exit
+                            }
+                        }
+                    ' "$plist" 2>/dev/null)
+                fi
+                pid=$(launchctl list 2>&1 | awk -v l="$label" '$3==l {print $1}')
+                echo "  $label:"
+                echo "    plist:  ${plist:-<not on disk>}"
+                echo "    exec:   ${exec_path:-<unparseable>}"
+                echo "    pid:    ${pid:--}"
+                if [ -z "$exec_path" ]; then
+                    echo "    status: UNKNOWN (couldn't parse plist)"
+                elif [[ "$exec_path" == "$plugin_root"/* ]]; then
+                    echo "    status: OK (current plugin root)"
+                elif [[ "$exec_path" == "$HOME/.claude/claude-drop/"* ]]; then
+                    echo "    status: STALE — pointing at deprecated in-tree install"
+                elif [[ "$exec_path" == "$HOME/.claude/plugins/cache/"* ]]; then
+                    echo "    status: STALE — pointing at a different plugin version"
+                else
+                    echo "    status: STALE — pointing outside the current plugin"
+                fi
+            done
+        fi
+        ;;
+    Linux)
+        echo "=== systemd user units ==="
+        units=$(systemctl --user list-unit-files 'claude-drop-*' --no-legend 2>/dev/null \
+            | awk '{print $1}' || true)
+        if [ -z "$units" ]; then
+            echo "  no claude-drop systemd user units installed"
+        else
+            for unit in $units; do
+                unit_file="$HOME/.config/systemd/user/$unit"
+                exec_line=$(grep -E '^ExecStart=' "$unit_file" 2>/dev/null | head -1)
+                # Extract the actual binary path. ExecStart can be:
+                #   ExecStart=/some/path/bin
+                #   ExecStart=/usr/bin/env python3 /some/path/bin
+                exec_path=""
+                if [ -n "$exec_line" ]; then
+                    rhs="${exec_line#ExecStart=}"
+                    for token in $rhs; do
+                        if [[ "$token" == /* ]] \
+                            && [[ "$token" != */env ]] \
+                            && [[ "$token" != *python3 ]]; then
+                            exec_path="$token"
+                            break
+                        fi
+                    done
+                fi
+                active=$(systemctl --user is-active "$unit" 2>/dev/null || true)
+                enabled=$(systemctl --user is-enabled "$unit" 2>/dev/null || true)
+                echo "  $unit:"
+                echo "    file:    ${unit_file:-<missing>}"
+                echo "    exec:    ${exec_path:-<not applicable>}"
+                echo "    active:  $active"
+                echo "    enabled: $enabled"
+                if [ -z "$exec_path" ]; then
+                    echo "    status:  (no ExecStart — this is normal for .path units)"
+                elif [[ "$exec_path" == "$plugin_root"/* ]]; then
+                    echo "    status:  OK (current plugin root)"
+                elif [[ "$exec_path" == "$HOME/.claude/claude-drop/"* ]]; then
+                    echo "    status:  STALE — pointing at deprecated in-tree install"
+                elif [[ "$exec_path" == "$HOME/.claude/plugins/cache/"* ]]; then
+                    echo "    status:  STALE — pointing at a different plugin version"
+                else
+                    echo "    status:  STALE — pointing outside the current plugin"
+                fi
+            done
+        fi
+        ;;
+    *)
+        echo "=== services ==="
+        echo "  unsupported platform: $(uname -s)"
+        ;;
+esac
+echo
+
+echo "=== deprecated in-tree install ==="
+if [ -d "$HOME/.claude/claude-drop" ]; then
+    echo "  ~/.claude/claude-drop/ EXISTS"
+    echo "  fix: rm -rf ~/.claude/claude-drop"
+else
+    echo "  ~/.claude/claude-drop/ absent (good)"
+fi
+echo
+
+echo "=== old hook scripts ==="
+old_hooks=()
+for h in session-claude-drop-init.sh user-prompt-claude-drop.sh pretool-claude-drop.sh; do
+    if [ -f "$HOME/.claude/hooks/$h" ]; then
+        old_hooks+=("$h")
+    fi
+done
+if [ "${#old_hooks[@]}" -gt 0 ]; then
+    echo "  pre-plugin hook scripts still present in ~/.claude/hooks/:"
+    for h in "${old_hooks[@]}"; do
+        echo "    - $h"
+    done
+    echo "  These do nothing on their own; they were called from settings.json"
+    echo "  before the plugin took over. Remove if settings.json no longer references them:"
+    echo "    rm ~/.claude/hooks/session-claude-drop-init.sh ~/.claude/hooks/user-prompt-claude-drop.sh ~/.claude/hooks/pretool-claude-drop.sh"
+else
+    echo "  no pre-plugin hook scripts remain (good)"
+fi
+echo
+
+exit 0

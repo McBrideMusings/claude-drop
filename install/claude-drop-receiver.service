@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.claude/claude-drop/bin/claude-drop-receiver
+ExecStart=__BIN_DIR__/claude-drop-receiver
 Restart=on-failure
 RestartSec=5
 Environment=PATH=/usr/local/bin:/usr/bin:/bin

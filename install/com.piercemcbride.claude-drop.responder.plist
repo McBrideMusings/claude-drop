@@ -8,7 +8,7 @@
     <array>
         <string>/usr/bin/env</string>
         <string>python3</string>
-        <string>__HOME__/.claude/claude-drop/bin/claude-drop-responder</string>
+        <string>__BIN_DIR__/claude-drop-responder</string>
     </array>
     <key>WatchPaths</key>
     <array>
