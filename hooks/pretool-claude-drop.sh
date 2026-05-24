@@ -9,18 +9,18 @@ set -u
 input=$(cat 2>/dev/null || true)
 [ -n "$input" ] || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
-[ -n "${SSH_CLIENT:-}" ] || exit 0
 
 tool=$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null || true)
 session_id=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null || true)
 [ -n "$session_id" ] || session_id="default"
 
-runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/claude-drop"
-cache_file="$runtime_dir/session-cache-$session_id.json"
-host_file="$runtime_dir/session-host-$session_id"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)"
+. "$HERE/claude-drop-lib.sh" 2>/dev/null || exit 0
 
-host=""
-[ -r "$host_file" ] && host=$(cat "$host_file" 2>/dev/null || true)
+runtime_dir=$(cd_runtime_dir)
+cache_file="$runtime_dir/session-cache-$session_id.json"
+
+host=$(cd_resolve_host "$runtime_dir" "$session_id")
 
 # rewrite_path <candidate> — echoes the local cached path or empty.
 rewrite_path() {
@@ -54,13 +54,13 @@ PY
                 local result
                 result=$(CLAUDE_DROP_TIMEOUT=3 timeout 3 "$fetch_bin" "$host" "$cand" 2>/dev/null || true)
                 [ -n "$result" ] || return 0
-                mapped=$(printf '%s' "$result" | python3 - "$cand" <<'PY' 2>/dev/null || true
+                mapped=$(python3 - "$result" "$cand" <<'PY' 2>/dev/null || true
 import json, sys
 try:
-    data = json.loads(sys.stdin.read())
+    data = json.loads(sys.argv[1])
 except Exception:
     sys.exit(0)
-r = data.get(sys.argv[1]) or {}
+r = data.get(sys.argv[2]) or {}
 if r.get("status") == "ok" and r.get("local_path"):
     print(r["local_path"])
 PY
@@ -107,14 +107,14 @@ case "$tool" in
         command=$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null || true)
         [ -n "$command" ] || exit 0
         # Find foreign paths in the command and rewrite them.
-        new_command=$(printf '%s' "$command" | python3 - "$cache_file" 2>/dev/null <<'PY' || true
+        new_command=$(python3 - "$cache_file" "$command" 2>/dev/null <<'PY' || true
 import json, os, re, sys
 cache = {}
 try:
     cache = json.load(open(sys.argv[1]))
 except Exception:
     cache = {}
-text = sys.stdin.read()
+text = sys.argv[2]
 if not cache:
     sys.stdout.write(text)
     sys.exit(0)

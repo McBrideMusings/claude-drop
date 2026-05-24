@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# SessionStart hook for Claude Drop. Resolves SSH_CLIENT to a tailnet host
-# once per session and caches the result for the UserPromptSubmit hook.
+# SessionStart hook for Claude Drop. Resolves the SSH-client host once per
+# session and caches it for the UserPromptSubmit and PreToolUse hooks.
+# For detached sessions with no SSH_CLIENT (e.g. background jobs) this seeds
+# the per-session host from the cross-session last-host fallback.
 # Always exits 0 so a hook bug never blocks session start.
 
 set -u
@@ -13,29 +15,10 @@ if [ -n "$input" ] && command -v jq >/dev/null 2>&1; then
 fi
 [ -n "$session_id" ] || session_id="default"
 
-[ -n "${SSH_CLIENT:-}" ] || exit 0
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)"
+. "$HERE/claude-drop-lib.sh" 2>/dev/null || exit 0
 
-runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/claude-drop"
-mkdir -p "$runtime_dir" 2>/dev/null || true
-chmod 700 "$runtime_dir" 2>/dev/null || true
-
-client_ip="${SSH_CLIENT%% *}"
-[ -n "$client_ip" ] || exit 0
-
-command -v tailscale >/dev/null 2>&1 || exit 0
-command -v jq >/dev/null 2>&1 || exit 0
-
-host=$(tailscale status --json 2>/dev/null \
-    | jq -r --arg ip "$client_ip" '
-        ([.Self] + (.Peer | to_entries | map(.value)))
-        | map(select(.TailscaleIPs and (.TailscaleIPs | index($ip))))
-        | first
-        | (.DNSName // "") | split(".") | .[0] // empty
-    ' 2>/dev/null)
-
-[ -n "$host" ] || exit 0
-
-printf '%s' "$host" > "$runtime_dir/session-host-$session_id"
-chmod 600 "$runtime_dir/session-host-$session_id" 2>/dev/null || true
+runtime_dir=$(cd_runtime_dir)
+cd_resolve_host "$runtime_dir" "$session_id" >/dev/null 2>&1 || true
 
 exit 0

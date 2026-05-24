@@ -14,45 +14,29 @@ prompt=$(printf '%s' "$input" | jq -r '.prompt // empty' 2>/dev/null || true)
 session_id=$(printf '%s' "$input" | jq -r '.session_id // empty' 2>/dev/null || true)
 [ -n "$session_id" ] || session_id="default"
 [ -n "$prompt" ] || exit 0
-[ -n "${SSH_CLIENT:-}" ] || exit 0
 
-runtime_dir="${XDG_RUNTIME_DIR:-/tmp}/claude-drop"
-mkdir -p "$runtime_dir" 2>/dev/null || true
-chmod 700 "$runtime_dir" 2>/dev/null || true
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)"
+. "$HERE/claude-drop-lib.sh" 2>/dev/null || exit 0
 
-host_file="$runtime_dir/session-host-$session_id"
-host=""
-if [ -r "$host_file" ]; then
-    host=$(cat "$host_file" 2>/dev/null || true)
-fi
-
-if [ -z "$host" ]; then
-    client_ip="${SSH_CLIENT%% *}"
-    if [ -n "$client_ip" ] && command -v tailscale >/dev/null 2>&1; then
-        host=$(tailscale status --json 2>/dev/null \
-            | jq -r --arg ip "$client_ip" '
-                ([.Self] + (.Peer | to_entries | map(.value)))
-                | map(select(.TailscaleIPs and (.TailscaleIPs | index($ip))))
-                | first
-                | (.DNSName // "") | split(".") | .[0] // empty
-            ' 2>/dev/null)
-        if [ -n "$host" ]; then
-            printf '%s' "$host" > "$host_file"
-            chmod 600 "$host_file" 2>/dev/null || true
-        fi
-    fi
-fi
+runtime_dir=$(cd_runtime_dir)
+host=$(cd_resolve_host "$runtime_dir" "$session_id")
 [ -n "$host" ] || exit 0
 
-candidates=$(printf '%s' "$prompt" | python3 - <<'PY' 2>/dev/null
+candidates=$(python3 - "$prompt" <<'PY' 2>/dev/null
 import re, sys
-prompt = sys.stdin.read()
+prompt = sys.argv[1]
+# A path with spaces pasted into a terminal becomes "Foo\ Bar" and may wrap as
+# "Foo\<newline>Bar". Join the continuation so the path stays on one line.
+prompt = prompt.replace("\\\n", " ")
 seen = set()
 out = []
 path_re = re.compile(r"(?:^|[\s`'\"(\[{])((?:/Users|/home|/Volumes|/mnt|~)/[^\n]*)")
 for m in path_re.finditer(prompt):
     cand = m.group(1).rstrip()
     cand = cand.rstrip(".,;:!?'\")]}")
+    # Unescape shell escapes ("\ " -> " ") so the candidate is a real path; the
+    # responder's prefix back-off trims any trailing words after it.
+    cand = re.sub(r"\\(.)", r"\1", cand)
     if cand and cand not in seen:
         seen.add(cand)
         out.append(cand)
@@ -80,12 +64,12 @@ result=$("$fetch_bin" "$host" "${cand_arr[@]}" 2>/dev/null || true)
 
 cache_file="$runtime_dir/session-cache-$session_id.json"
 
-context=$(printf '%s' "$result" | python3 - "$host" "$cache_file" <<'PY' 2>/dev/null
+context=$(python3 - "$result" "$host" "$cache_file" <<'PY' 2>/dev/null
 import json, sys, os
-host = sys.argv[1]
-cache_file = sys.argv[2]
+host = sys.argv[2]
+cache_file = sys.argv[3]
 try:
-    data = json.loads(sys.stdin.read())
+    data = json.loads(sys.argv[1])
 except Exception:
     sys.exit(0)
 
