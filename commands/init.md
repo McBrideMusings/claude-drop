@@ -14,11 +14,16 @@ in absolute paths.
 
 ## Instructions
 
-1. Run the init script with the Bash tool:
+1. Run **exactly** this command with the Bash tool — do not substitute a
+   concrete path or guess a version; let the shell resolve it:
 
    ```
-   "${CLAUDE_PLUGIN_ROOT}/bin/claude-drop-init" --no-hooks
+   CONF="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"; D="$CONF/plugins/cache/mcbridemusings/claude-drop"; VER="$(ls "$D" 2>/dev/null | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"; [ -n "$VER" ] && "$D/$VER/bin/claude-drop-init" --no-hooks || echo "claude-drop not found under $D"
    ```
+
+   This finds the latest installed plugin version under the cache and runs
+   its init binary, so it stays correct across OSes and plugin updates
+   without relying on `${CLAUDE_PLUGIN_ROOT}` (which is not set in the shell).
 
    `--no-hooks` is required — the plugin handles hook registration on its
    own; the script should never touch `~/.claude/settings.json` here.

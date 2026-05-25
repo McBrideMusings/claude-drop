@@ -9,11 +9,16 @@ attention.
 
 ## Instructions
 
-1. Run the doctor script with the Bash tool:
+1. Run **exactly** this command with the Bash tool — do not substitute a
+   concrete path or guess a version; let the shell resolve it:
 
    ```
-   "${CLAUDE_PLUGIN_ROOT}/bin/claude-drop-doctor"
+   CONF="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"; D="$CONF/plugins/cache/mcbridemusings/claude-drop"; VER="$(ls "$D" 2>/dev/null | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"; [ -n "$VER" ] && "$D/$VER/bin/claude-drop-doctor" || echo "claude-drop not found under $D"
    ```
+
+   This finds the latest installed plugin version under the cache and runs
+   its doctor binary, so it stays correct across OSes and plugin updates
+   without relying on `${CLAUDE_PLUGIN_ROOT}` (which is not set in the shell).
 
 2. Parse the output (free-form text grouped into sections). Summarize the
    user-visible state as a short checklist:
